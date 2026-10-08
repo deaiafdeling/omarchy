@@ -21,8 +21,8 @@
 # LLM cleanup pass — local or hosted, anything that speaks this contract.
 # Rejection rules keep a broken service from degrading the keybind: unset or
 # empty URL -> silent no-op (stock tesseract text ships untouched); HTTP
-# errors, timeouts and non-string JSON answers -> treated as "no refinement",
-# never as text.
+# errors, redirects, timeouts and non-string JSON answers -> treated as
+# "no refinement", never as text.
 
 REFINE_URL="${OMARCHY_OCR_REFINE_URL:-}"
 [[ -z $REFINE_URL ]] && exit 0
@@ -38,12 +38,21 @@ print(json.dumps({"text": sys.stdin.read()}))') || exit 0
 AUTH=()
 [[ -n ${OMARCHY_OCR_REFINE_KEY:-} ]] && AUTH=(-H "Authorization: Bearer $OMARCHY_OCR_REFINE_KEY")
 
-# --fail: an HTTP error (4xx/5xx) must never reach the parser, so an error
-# body like {"text":"Service unavailable"} can never become clipboard text.
-RESPONSE=$(curl -s --fail --max-time "$TIMEOUT" -X POST "$REFINE_URL" \
+# Write the HTTP status after the body separated by a newline (-w), then
+# accept the body only on a 2xx status. This rejects 4xx/5xx (error bodies
+# like {"text":"Service unavailable"}) AND redirects (301/302 serving an HTML
+# page) — neither can ever become clipboard text. Following redirects to
+# another origin would also leak the bearer token, so they are treated as
+# failure by design.
+RAW=$(curl -s --max-time "$TIMEOUT" -X POST "$REFINE_URL" \
   -H 'Content-Type: application/json' \
   "${AUTH[@]}" \
-  --data-binary "$BODY") || exit 0
+  --data-binary "$BODY" \
+  -w '\n%{http_code}') || exit 0
+
+STATUS=${RAW##*$'\n'}
+RESPONSE=${RAW%$'\n'*}
+[[ $STATUS =~ ^2[0-9][0-9]$ ]] || exit 0
 
 [[ -z $RESPONSE ]] && exit 0
 

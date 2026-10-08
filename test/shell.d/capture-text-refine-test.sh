@@ -14,8 +14,12 @@ require_command curl
 require_command python3
 
 TMPDIR=$(mktemp -d)
-KEEPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+trap cleanup EXIT
+SERVER_PID=""
+cleanup() {
+  [[ -n $SERVER_PID ]] && kill "$SERVER_PID" 2>/dev/null
+  rm -rf "$TMPDIR"
+}
 
 # Redirect background-server output and clean up on exit (conventions doc).
 LOG="$TMPDIR/server-log"
@@ -46,17 +50,26 @@ class Handler(BaseHTTPRequestHandler):
             out = parsed.get("text", "").replace("teh", "the").encode()
             self.send_response(200)
             # Documented raw contract: a plain text answer, not JSON.
-            self.headers["Content-Type"] = "text/plain"
+            self.send_header("Content-Type", "text/plain")
         elif mode == "error-json":
             out = json.dumps({"text": "Service unavailable"}).encode()
             self.send_response(503)
         elif mode == "bool":
             out = json.dumps({"text": True}).encode()
             self.send_response(200)
+        elif mode == "redirect":
+            self.send_response(302)
+            self.send_header("Location", "http://example.invalid/new")
         elif mode == "hang":
             time.sleep(30)
             out = b"{}"
             self.send_response(200)
+        elif mode == "auth":
+            # Record the exact Authorization header; only the right one refines.
+            auth = self.headers.get("Authorization", "")
+            out = (json.dumps({"text": "AUTH=" + auth}).encode()
+                   if auth == "Bearer test-key-123" else b"{}")
+            self.send_response(200 if auth == "Bearer test-key-123" else 401)
         else:
             out = b"{}"
             self.send_response(200)
@@ -86,6 +99,7 @@ PY
 stop_server() {
   kill "$SERVER_PID" 2>/dev/null || true
   wait "$SERVER_PID" 2>/dev/null || true
+  SERVER_PID=""
 }
 
 run_helper() {
@@ -114,11 +128,8 @@ pass "JSON contract answer replaces the raw text"
 stop_server
 start_server "clean-raw"
 port=$(cat "$TMPDIR/port")
-out=$(printf 'teh raw body answer' | OMARCHY_OCR_REFINE_URL="http://127.0.0.1:$port/x" run_helper 2>"$TMPDIR/raw-err") || true
-raw_err=$(cat "$TMPDIR/raw-err")
-if [[ $out != "the raw body answer" ]]; then
-  fail "raw text answer replaces the raw text (got $out; server-log: $(tail -2 "$LOG" 2>/dev/null | tr '\n' ' '); helper stderr: $raw_err)"
-fi
+out=$(printf 'teh raw body answer' | OMARCHY_OCR_REFINE_URL="http://127.0.0.1:$port/x" run_helper)
+[[ $out == "the raw body answer" ]] || fail "raw text answer replaces the raw text (got $out)"
 pass "raw text answer replaces the raw text"
 
 # ── HTTP 503 error body: rejected, raw text kept ─────────────
@@ -129,6 +140,14 @@ out=$(printf 'teh raw' | OMARCHY_OCR_REFINE_URL="http://127.0.0.1:$port/x" run_h
 [[ -z $out ]] || fail "an HTTP error body never becomes refined text (got $out)"
 pass "HTTP error body is rejected, raw text kept"
 
+# ── redirect: rejected, raw text kept ────────────────────────
+stop_server
+start_server "redirect"
+port=$(cat "$TMPDIR/port")
+out=$(printf 'teh raw' | OMARCHY_OCR_REFINE_URL="http://127.0.0.1:$port/x" run_helper)
+[[ -z $out ]] || fail "a redirect page never becomes refined text (got $out)"
+pass "redirect answer is rejected, raw text kept"
+
 # ── non-string answer: rejected ──────────────────────────────
 stop_server
 start_server "bool"
@@ -137,22 +156,24 @@ out=$(printf 'teh raw' | OMARCHY_OCR_REFINE_URL="http://127.0.0.1:$port/x" run_h
 [[ -z $out ]] || fail "a non-string text answer never becomes refined text (got $out)"
 pass "non-string text answer is rejected"
 
-# ── bearer key reaches the endpoint ──────────────────────────
+# ── bearer key: sent verbatim, wrong/missing key rejected ────
 stop_server
-start_server "clean-json"
+start_server "auth"
 port=$(cat "$TMPDIR/port")
-AUTH_LOG="$TMPDIR/auth"
-printf 'teh authed' | OMARCHY_OCR_REFINE_URL="http://127.0.0.1:$port/x" \
-  OMARCHY_OCR_REFINE_KEY="test-key-123" run_helper >/dev/null
-grep -F "Bearer test-key-123" "$LOG" >/dev/null 2>&1 \
-  || out2=$(printf 'teh authed' | OMARCHY_OCR_REFINE_URL="http://127.0.0.1:$port/x" \
-      OMARCHY_OCR_REFINE_KEY="test-key-123" run_helper)
-# The stub echoes refinement regardless; assert via a second pass that output
-# still flows with a key present (auth rejection is the endpoint's concern).
-out=$(printf 'teh with key' | OMARCHY_OCR_REFINE_URL="http://127.0.0.1:$port/x" \
+out=$(printf 'teh authed' | OMARCHY_OCR_REFINE_URL="http://127.0.0.1:$port/x" \
   OMARCHY_OCR_REFINE_KEY="test-key-123" run_helper)
-[[ $out == "the with key" ]] || fail "bearer key does not break the happy path (got $out)"
-pass "bearer key is accepted and sent"
+[[ $out == "AUTH=Bearer test-key-123" ]] ||
+  fail "the Authorization header must arrive exactly as Bearer <key> (got $out)"
+pass "bearer key is sent verbatim (Authorization: Bearer <key>)"
+
+out=$(printf 'teh wrong' | OMARCHY_OCR_REFINE_URL="http://127.0.0.1:$port/x" \
+  OMARCHY_OCR_REFINE_KEY="wrong-key" run_helper)
+[[ -z $out ]] || fail "a wrong key (401) must degrade to raw text (got $out)"
+pass "401 on wrong key degrades to raw text"
+
+out=$(printf 'teh nokey' | OMARCHY_OCR_REFINE_URL="http://127.0.0.1:$port/x" run_helper)
+[[ -z $out ]] || fail "a missing key (401) must degrade to raw text (got $out)"
+pass "401 on missing key degrades to raw text"
 
 stop_server
 
@@ -180,5 +201,4 @@ grep -F 'wl-copy 9>&- >/dev/null 2>&1' "$ROOT/bin/omarchy-capture-text" >/dev/nu
   fail "capture-text detaches wl-copy so pipe-waiting callers never hang"
 pass "capture-text detaches wl-copy"
 
-printf '%s\n' "$out" >/dev/null  # keep last value referenced (shellcheck quiet)
 exit 0
