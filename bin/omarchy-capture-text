@@ -26,7 +26,7 @@ TEXT=$(grim -g "$SELECTION" - | tesseract stdin stdout --oem 1 --psm 6 -l "${OMA
 
 [[ -z $TEXT ]] && exit 1
 
-REFINED=$(omarchy-capture-text-refine "$TEXT" 2>/dev/null)
+REFINED=$(printf '%s' "$TEXT" | omarchy-capture-text-refine 2>/dev/null)
 if [[ -n $REFINED ]]; then
   TEXT=$REFINED
 fi
