@@ -1,0 +1,55 @@
+#!/bin/bash
+
+# omarchy:summary=Refine OCR text via a configured OCR refine service (no-op without one)
+# omarchy:group=capture
+# omarchy:examples=echo text | omarchy capture text-refine
+# omarchy:hidden=true
+
+# Stdin: raw OCR text. Stdout: refined text, or nothing (then the caller keeps
+# the raw text). Exit 0 even when nothing is configured — this helper is a
+# pass-through hook, not a dependency.
+
+# Refine service contract (asymmetric OCR):
+#   OMARCHY_OCR_REFINE_URL   full POST endpoint accepting JSON
+#                            {"text": "<raw ocr text>"} and returning
+#                            {"text": "<cleaned text>"} (or raw text body)
+#   OMARCHY_OCR_REFINE_KEY   optional bearer token sent as Authorization
+#   OMARCHY_OCR_REFINE_TIMEOUT   seconds, default 60
+#
+# A local service can wrap any engine pair (e.g. RapidOCR + PaddleOCR) and an
+# LLM cleanup pass; a remote endpoint can be anything that speaks the two-field
+# JSON contract. Unset/empty URL -> helper exits silently -> stock tesseract
+# text is used untouched.
+
+REFINE_URL="${OMARCHY_OCR_REFINE_URL:-}"
+[[ -z $REFINE_URL ]] && exit 0
+
+TEXT=$(cat)
+[[ -z $TEXT ]] && exit 0
+
+TIMEOUT="${OMARCHY_OCR_REFINE_TIMEOUT:-60}"
+
+BODY=$(printf '%s' "$TEXT" | python3 -c 'import json,sys
+print(json.dumps({"text": sys.stdin.read()}))') || exit 0
+
+AUTH=()
+[[ -n ${OMARCHY_OCR_REFINE_KEY:-} ]] && AUTH=(-H "Authorization: Bearer $OMARCHY_OCR_REFINE_KEY")
+
+RESPONSE=$(curl -s --max-time "$TIMEOUT" -X POST "$REFINE_URL" \
+  -H 'Content-Type: application/json' \
+  "${AUTH[@]}" \
+  --data-binary "$BODY") || exit 0
+
+[[ -z $RESPONSE ]] && exit 0
+
+CLEANED=$(printf '%s' "$RESPONSE" | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    t = d.get("text") if isinstance(d, dict) else None
+    print(t or "")
+except Exception:
+    print("")') || exit 0
+
+[[ -z $CLEANED ]] && exit 0
+
+printf '%s' "$CLEANED"
