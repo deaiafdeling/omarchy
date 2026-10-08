@@ -17,7 +17,7 @@ TMPDIR=$(mktemp -d)
 trap cleanup EXIT
 SERVER_PID=""
 cleanup() {
-  [[ -n $SERVER_PID ]] && kill "$SERVER_PID" 2>/dev/null
+  [[ -n $SERVER_PID ]] && kill "$SERVER_PID" 2>/dev/null || true
   rm -rf "$TMPDIR"
 }
 
@@ -58,6 +58,9 @@ class Handler(BaseHTTPRequestHandler):
             out = json.dumps({"text": True}).encode()
             self.send_response(200)
         elif mode == "redirect":
+            # Nonempty HTML body: the old helper (pre-status-gate) printed it
+            # verbatim, so this stub must actually serve it to catch that.
+            out = b"<html><body>301 Moved</body></html>"
             self.send_response(302)
             self.send_header("Location", "http://example.invalid/new")
         elif mode == "hang":
